@@ -7,8 +7,10 @@ import os
 import urllib.parse
 from glob import glob
 import sys
-import config
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
 
 # Twitter API credentials from environment variables
 ACCESS_TOKEN = os.getenv('TWITTER_ACCESS_TOKEN', '')
@@ -24,8 +26,8 @@ REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', '')
 
 # Subreddit from which it will collect data
 SUBREDDIT_NAME = 'simracing'
-# Path where post images will be downloaded
-IMG_DIR = 'img'
+# Path where post images and videos will be downloaded
+MEDIA_DIR = 'media'
 # File where tweeted posts are logged to avoid duplicates
 LOG = 'log.txt'
 # Maximum number of lines the log file will store, to prevent the file from getting too large
@@ -47,7 +49,7 @@ def connect_reddit():
         print(f'[bot] Error connecting to Reddit: {e}')
         raise
 
-# Gets the hot posts from the selected subreddit. Tweets the first valid one and stops.
+# Gets the 5 hot posts from the selected subreddit. If none can be tweeted, it stops.
 def get_posts(reddit):
 
     subreddit = reddit.subreddit(SUBREDDIT_NAME)
@@ -65,7 +67,7 @@ def get_posts(reddit):
             return True
     
     print('[bot] None of the posts could be tweeted. Stopping bot')
-    delete_images()
+    delete_media()
     return False
 
 def create_tweet(post_id, post_title, post_url):
@@ -77,19 +79,19 @@ def create_tweet(post_id, post_title, post_url):
         print(f'[bot] Post {post_id} already tweeted, skipping')
         return False
     
-    image = convert_image(post_url)
-    if image is False:
-        print(f'[bot] Post {post_id} is not an image, skipping')
+    media = download_media(post_url)
+    if media is False:
+        print(f'[bot] Post {post_id} is not an image or video, skipping')
         return False
     
     try:
-        success = publish_tweet(post_title, image, post_id)
+        success = publish_tweet(post_title, media, post_id)
         return success
     except Exception as e:
         print(f'[bot] Error publishing tweet: {e}')
-        # Clean up downloaded image on error
-        if os.path.exists(image):
-            os.remove(image)
+        # Clean up downloaded media on error
+        if os.path.exists(media):
+            os.remove(media)
         return False
 
 # Checks if a post has already been tweeted
@@ -108,80 +110,178 @@ def is_duplicate(post_id):
         print(f'[bot] Error reading log file: {e}')
         return False
 
-# convert_image() checks if the URL the post points to is an image, if so, downloads it to the 'img' path.
-# This function returns the string of the path + the image. Example: img/q3588wtf.png
-def convert_image(post_url):
+# download_media() checks if the URL points to an image or video, and downloads it to the 'media' folder.
+# This function returns the path to the downloaded file. Example: media/q3588wtf.png or media/video123.mp4
+def download_media(post_url):
     """
-    Checks if URL is an image and downloads it.
-    Returns image path if successful, False otherwise.
+    Checks if URL is an image or video and downloads it.
+    Returns media file path if successful, False otherwise.
     """
-    # Common image URL patterns
+    # Common image and video extensions
     image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-    image_domains = ['imgur.com', 'i.redd.it', 'i.reddit.com', 'preview.redd.it']
+    video_extensions = ['.mp4', '.mov', '.webm', '.gifv']
+    media_domains = ['imgur.com', 'i.redd.it', 'i.reddit.com', 'preview.redd.it', 'v.redd.it']
     
-    # Check if URL ends with image extension
+    # Check if URL ends with media extension
     url_lower = post_url.lower()
     is_image_url = any(url_lower.endswith(ext) for ext in image_extensions)
+    is_video_url = any(url_lower.endswith(ext) for ext in video_extensions)
     
-    # Check if URL is from known image domains
-    is_image_domain = any(domain in url_lower for domain in image_domains)
+    # Check if URL is from known media domains
+    is_media_domain = any(domain in url_lower for domain in media_domains)
     
-    if not (is_image_url or is_image_domain):
-        print(f'[bot] URL does not appear to be an image: {post_url}')
+    # Special handling for v.redd.it (Reddit video) and gifv (Imgur video)
+    if 'v.redd.it' in url_lower:
+        # Reddit videos need special handling - they're usually in DASH format
+        print(f'[bot] Detected Reddit video: {post_url}')
+        return download_reddit_video(post_url)
+    elif url_lower.endswith('.gifv'):
+        # Convert .gifv to .mp4 for Imgur
+        post_url = post_url.replace('.gifv', '.mp4')
+        is_video_url = True
+    
+    if not (is_image_url or is_video_url or is_media_domain):
+        print(f'[bot] URL does not appear to be media: {post_url}')
         return False
     
-    # Handle imgur links that might need .jpg extension
-    if 'imgur.com' in post_url and not any(ext in post_url for ext in image_extensions):
-        post_url = post_url + '.jpg'
+    # Handle imgur links that might need extension
+    if 'imgur.com' in post_url and not (is_image_url or is_video_url):
+        # Try image first, then video
+        test_url = post_url + '.jpg'
+        try:
+            test_response = requests.head(test_url, timeout=5)
+            if test_response.status_code == 200:
+                post_url = test_url
+                is_image_url = True
+        except:
+            pass
     
     try:
         # Get filename from URL
         parsed = urllib.parse.urlsplit(post_url)
-        image_name = os.path.basename(parsed.path)
+        media_name = os.path.basename(parsed.path)
         
-        # If no extension, try to get it from content-type or default to .jpg
-        if not any(image_name.lower().endswith(ext) for ext in image_extensions):
-            image_name = image_name + '.jpg'
+        # Determine file extension based on content or URL
+        if not any(media_name.lower().endswith(ext) for ext in image_extensions + video_extensions):
+            # Default to .jpg for images, .mp4 for videos
+            if is_video_url or 'video' in url_lower:
+                media_name = media_name + '.mp4'
+            else:
+                media_name = media_name + '.jpg'
         
-        image_path = os.path.join(IMG_DIR, image_name)
-        print(f'[bot] Downloading image from {post_url} to {image_path}')
+        media_path = os.path.join(MEDIA_DIR, media_name)
+        print(f'[bot] Downloading media from {post_url} to {media_path}')
         
         # Download with timeout and proper headers
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(post_url, stream=True, headers=headers, timeout=10)
+        response = requests.get(post_url, stream=True, headers=headers, timeout=30)
         
         if response.status_code == 200:
             # Check content type
-            content_type = response.headers.get('content-type', '')
-            if 'image' not in content_type:
-                print(f'[bot] URL does not return an image (content-type: {content_type})')
+            content_type = response.headers.get('content-type', '').lower()
+            
+            # Determine if it's video or image
+            is_video = 'video' in content_type or any(media_path.lower().endswith(ext) for ext in video_extensions)
+            is_image = 'image' in content_type or any(media_path.lower().endswith(ext) for ext in image_extensions)
+            
+            if not (is_video or is_image):
+                print(f'[bot] URL does not return media (content-type: {content_type})')
                 return False
             
-            with open(image_path, 'wb') as image_file:
+            # Download the file
+            with open(media_path, 'wb') as media_file:
                 for chunk in response.iter_content(chunk_size=8192):
-                    image_file.write(chunk)
+                    media_file.write(chunk)
             
             # Verify file was created and has content
-            if os.path.exists(image_path) and os.path.getsize(image_path) > 0:
-                return image_path
+            if os.path.exists(media_path) and os.path.getsize(media_path) > 0:
+                file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
+                media_type = 'video' if is_video else 'image'
+                print(f'[bot] Downloaded {media_type}: {media_path} ({file_size_mb:.2f} MB)')
+                return media_path
             else:
                 print('[bot] Downloaded file is empty or missing')
                 return False
         else:
-            print(f'[bot] Failed to download image: HTTP {response.status_code}')
+            print(f'[bot] Failed to download media: HTTP {response.status_code}')
             return False
             
     except requests.exceptions.RequestException as e:
-        print(f'[bot] Error downloading image: {e}')
+        print(f'[bot] Error downloading media: {e}')
         return False
     except Exception as e:
-        print(f'[bot] Unexpected error processing image: {e}')
+        print(f'[bot] Unexpected error processing media: {e}')
         return False
 
-# Logs into Twitter with tweepy and tweets the title along with the image
-def publish_tweet(post_title, image, post_id):
+def download_reddit_video(post_url):
     """
-    Publishes a tweet with the post title and image.
+    Downloads Reddit video. Reddit videos are tricky - they use DASH format.
+    This function tries to get the direct video URL.
+    """
+    try:
+        # Reddit video URLs often need to be accessed differently
+        # Try to get the direct video link
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        
+        # For v.redd.it, we need to get the actual video URL
+        # Reddit embeds videos in a JSON structure
+        # Try common video URL patterns
+        video_id = os.path.basename(urllib.parse.urlsplit(post_url).path)
+        
+        # Try DASH playlist URL (most common)
+        dash_url = f"https://v.redd.it/{video_id}/DASH_720.mp4"
+        
+        response = requests.head(dash_url, headers=headers, timeout=10, allow_redirects=True)
+        if response.status_code == 200:
+            # Download the video
+            media_name = f"{video_id}.mp4"
+            media_path = os.path.join(MEDIA_DIR, media_name)
+            
+            print(f'[bot] Downloading Reddit video from {dash_url}')
+            video_response = requests.get(dash_url, stream=True, headers=headers, timeout=60)
+            
+            if video_response.status_code == 200:
+                with open(media_path, 'wb') as video_file:
+                    for chunk in video_response.iter_content(chunk_size=8192):
+                        video_file.write(chunk)
+                
+                if os.path.exists(media_path) and os.path.getsize(media_path) > 0:
+                    file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
+                    print(f'[bot] Downloaded video: {media_path} ({file_size_mb:.2f} MB)')
+                    return media_path
+        
+        # If DASH_720 doesn't work, try lower quality
+        for quality in ['480', '360', '240']:
+            dash_url = f"https://v.redd.it/{video_id}/DASH_{quality}.mp4"
+            response = requests.head(dash_url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                media_name = f"{video_id}.mp4"
+                media_path = os.path.join(MEDIA_DIR, media_name)
+                
+                print(f'[bot] Downloading Reddit video (quality {quality}) from {dash_url}')
+                video_response = requests.get(dash_url, stream=True, headers=headers, timeout=60)
+                
+                if video_response.status_code == 200:
+                    with open(media_path, 'wb') as video_file:
+                        for chunk in video_response.iter_content(chunk_size=8192):
+                            video_file.write(chunk)
+                    
+                    if os.path.exists(media_path) and os.path.getsize(media_path) > 0:
+                        file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
+                        print(f'[bot] Downloaded video: {media_path} ({file_size_mb:.2f} MB)')
+                        return media_path
+        
+        print(f'[bot] Could not download Reddit video from {post_url}')
+        return False
+        
+    except Exception as e:
+        print(f'[bot] Error downloading Reddit video: {e}')
+        return False
+
+# Logs into Twitter with tweepy and tweets the title along with the media (image or video)
+def publish_tweet(post_title, media_file, post_id):
+    """
+    Publishes a tweet with the post title and media (image or video).
     Returns True if successful, False otherwise.
     """
     try:
@@ -204,10 +304,26 @@ def publish_tweet(post_title, image, post_id):
             max_title_length = 280 - len(f" redd.it/{post_id}")
             tweet_text = f"{post_title[:max_title_length-3]}... redd.it/{post_id}"
 
-        print(f'[bot] Tweeting: {tweet_text[:50]}... with image: {image}')
+        # Determine if it's a video or image
+        media_lower = media_file.lower()
+        is_video = any(media_lower.endswith(ext) for ext in ['.mp4', '.mov', '.webm'])
+        
+        media_type = 'video' if is_video else 'image'
+        print(f'[bot] Tweeting: {tweet_text[:50]}... with {media_type}: {media_file}')
         
         # Upload media
-        media = api.media_upload(filename=image)
+        # For videos, we need to use media_category parameter
+        if is_video:
+            # Twitter requires videos to be uploaded with media_category
+            print('[bot] Uploading video (this may take a while)...')
+            media = api.media_upload(
+                filename=media_file,
+                media_category='tweet_video'  # Important for videos
+            )
+        else:
+            # Images upload normally
+            media = api.media_upload(filename=media_file)
+        
         media_list = [media.media_id_string]
         
         # Create tweet
@@ -218,7 +334,7 @@ def publish_tweet(post_title, image, post_id):
             # Only log after successful tweet
             log_post_id(post_id)
             check_log_file_size()
-            delete_images()
+            delete_media()
             return True
         else:
             print('[bot] Failed to publish tweet')
@@ -238,30 +354,29 @@ def log_post_id(post_id):
 
 # Deletes the first line of the log file to prevent the log file from getting too large, if the file has more than X lines (to avoid duplicates)
 def check_log_file_size():
-    if not os.path.exists(LOG):
-        return
-    
-    try:
-        with open(LOG, 'r') as file_log_in:
-            data = file_log_in.readlines()
-        
-        # If the file exceeds the allowed number of lines, delete the first one
-        if len(data) > MAX_LOG_LINES:
-            with open(LOG, 'w') as file_log_out:
-                file_log_out.writelines(data[1:])
-            print(f'[bot] Log file trimmed to {MAX_LOG_LINES} lines')
-    except Exception as e:
-        print(f'[bot] Error checking log file size: {e}')
 
-# Deletes images from /img
-def delete_images():
+    with open(LOG, 'r') as file_log_in:
+        # Store the entire file with line breaks in the data variable
+        data = file_log_in.read().splitlines(True)
+        # Count the lines in the file
+        counter = 0
+        for line in data:
+            counter += 1
+
+    # If the file exceeds the allowed number of lines, delete the first one
+    if(counter > MAX_LOG_LINES):
+        with open(LOG, 'w') as file_log_out:
+            file_log_out.writelines(data[1:])
+
+# Deletes media files (images and videos) from /media
+def delete_media():
     try:
-        for filename in glob(os.path.join(IMG_DIR, '*')):
+        for filename in glob(os.path.join(MEDIA_DIR, '*')):
             if os.path.isfile(filename):
                 os.remove(filename)
                 print(f'[bot] Deleted {filename}')
     except Exception as e:
-        print(f'[bot] Error deleting images: {e}')
+        print(f'[bot] Error deleting media: {e}')
 
 def main():
     # Validate required environment variables
@@ -274,16 +389,17 @@ def main():
         if not all(vars_list):
             print(f'[bot] ERROR: Missing {service} credentials in environment variables!')
             print(f'[bot] Please set all required variables in your .env file')
+            print(f'[bot] See .env.example for reference')
             sys.exit(1)
     
-    # Creates the image directory and/or log if they don't exist
+    # Creates the media directory and/or log if they don't exist
     if not os.path.exists(LOG):
         with open(LOG, 'w'):
             pass
     
-    if not os.path.exists(IMG_DIR):
-        os.makedirs(IMG_DIR)
-        print(f'[bot] Created image directory: {IMG_DIR}')
+    if not os.path.exists(MEDIA_DIR):
+        os.makedirs(MEDIA_DIR)
+        print(f'[bot] Created media directory: {MEDIA_DIR}')
 
     try:
         # Connects to reddit
@@ -295,11 +411,11 @@ def main():
         
     except KeyboardInterrupt:
         print('\n[bot] Bot stopped by user')
-        delete_images()
+        delete_media()
         sys.exit(0)
     except Exception as e:
         print(f'[bot] Fatal error: {e}')
-        delete_images()
+        delete_media()
         sys.exit(1)
 
 if __name__ == '__main__':

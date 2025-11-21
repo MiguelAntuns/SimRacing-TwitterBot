@@ -1,4 +1,6 @@
 # Environment variables - NEVER commit these!
+**/.env
+/.env
 .env
 
 # Python
@@ -9,6 +11,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -34,16 +37,21 @@ wheels/
 *~
 
 # Bot specific
-img/
+media/
 *.jpg
+*.jpeg
 *.png
 *.gif
 *.webp
+*.mp4
+*.mov
+*.webm
 log.txt
 
 # OS
 .DS_Store
 Thumbs.db
+
 
 
 
